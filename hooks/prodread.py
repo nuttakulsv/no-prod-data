@@ -54,10 +54,13 @@ INNER = [re.compile(r"\b(?:bash|sh|zsh|dash|ksh)\s+(?:-\w+\s+)*-\w*c\w*\s+" + QU
          re.compile(r"\bssh\s+(?:-\S+(?:\s+(?!-)\S+)?\s+)*\S+\s+" + QUOTED), re.compile(r"\$\(((?:[^()]|\([^()]*\))*)\)"),
          re.compile(r"`([^`]*)`"), re.compile(r"\bwatch\s+(?:-\S+(?:\s+(?!-)\S+)?\s+)*" + QUOTED)]
 # commands that only print or search text: a client name inside their quoted arguments is just text
-# Only commands that can't run other programs (not awk, sed, find, sort, rg, git: they can).
-HARMLESS = re.compile(r"^\s*(?:\w+=\S+\s+)*(?:echo|printf|grep|egrep|fgrep|cat|head|tail|wc|ls|which|type)\b")
-# text that ends up being run by a shell or interpreter makes nothing harmless
-PIPE_TO_SHELL = re.compile(r"\|\s*(?:sudo\s+)?(?:\S*/)?(?:sh|bash|zsh|dash|ksh|eval|xargs|parallel|source|python3?|perl|ruby|node)\b")
+# Only commands that print or search text and can't run other programs (not awk, sed, find, sort, rg, git: they can).
+HARMLESS = {"echo", "printf", "grep", "egrep", "fgrep", "cat", "head", "tail", "wc", "ls", "which", "type"}
+# wrappers that run the command after them, and their options that take a value
+WRAPPERS = {"sudo": "-u -g -h -p -C -D -r -t -U", "doas": "-u -C", "env": "-u -C -S", "time": "-o -f", "nohup": "",
+            "command": "", "exec": "-a", "nice": "-n", "ionice": "-c -n -p -P -u", "stdbuf": "-i -o -e",
+            "timeout": "-k -s", "xargs": "-I -i -L -l -n -P -s -d -E -a"}
+SHELL_KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "(", "time"}
 ASSIGN = re.compile(r"(?:^|[\s;&|])(?:export\s+)?([A-Za-z_]\w*)=(\"[^\"]*\"|'[^']*'|[^\s;&|]+)")
 
 # statements that only look at structure or counts; each must match the WHOLE statement
@@ -172,6 +175,37 @@ def expand(command, depth=0):
     return found
 
 
+def argv0(text):
+    """The program a shell command line actually runs, read the way the shell reads it (quotes, NAME=value
+    prefixes, wrappers and their options). None if it can't be parsed."""
+    try:
+        lex = shlex.shlex(text, posix=True)
+        lex.whitespace_split = True
+        lex.commenters = ""
+        tokens = list(lex)
+    except ValueError:
+        return None
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i].lstrip("({!")
+        if not tok or tok in SHELL_KEYWORDS or re.match(r"^[A-Za-z_]\w*=", tok):
+            i += 1
+            continue
+        name = tok.rsplit("/", 1)[-1]
+        if name not in WRAPPERS:
+            return name
+        takes_value = WRAPPERS[name].split()
+        i += 1
+        while i < len(tokens) and tokens[i].startswith("-"):
+            opt = tokens[i]
+            i += 1
+            if opt in takes_value and i < len(tokens):
+                i += 1
+        if name == "timeout" and i < len(tokens) and re.match(r"^\d", tokens[i]):
+            i += 1
+    return None
+
+
 def shell_words(text):
     """Roughly what the shell will run: quotes and backslash escapes removed, so ps"q"l and p\\sql read as psql."""
     return re.sub(r"\\(.)", r"\1", re.sub(r"[\"']", "", text))
@@ -205,10 +239,9 @@ def check_segment(seg, piped, cwd, assigned, context, shell_pipe=False):
         return None if texts and only_metadata(texts) else ASK.format(target=target)
     # what the shell will run: quote characters dropped, contents kept, unless the command only prints or searches text
     head = seg.split("<<")[0]
-    harmless = (HARMLESS.match(shell_words(head)) and not shell_pipe
-                and not re.search(r"[(){}`]|\$\(", re.sub(QUOTED, "", head)))
-    words = shell_words(re.sub(QUOTED, " ", head)) if harmless else shell_words(head)
-    if CLIENT_WORD.search(re.sub(r"\s#.*$", "", words)):
+    if argv0(head) in HARMLESS and not shell_pipe and not re.search(r"`|\$\(", head):
+        return None  # it only prints or searches its arguments; command substitutions are checked separately
+    if CLIENT_WORD.search(shell_words(head)):
         return ASK.format(target=target)
     return None
 
@@ -219,8 +252,10 @@ def check_command(command, cwd="."):
     for k, v in ASSIGN.findall(command):
         assigned.setdefault(k, []).append(unquote(v))
     for text, context in expand(command):
-        shell_pipe = bool(PIPE_TO_SHELL.search(text))
-        for seg, piped in segments(text):
+        segs = segments(text)
+        # default-deny: if anything in a pipeline isn't a known print/search command, nothing in it is harmless
+        shell_pipe = any(piped and argv0(seg.split("<<")[0]) not in HARMLESS for seg, piped in segs)
+        for seg, piped in segs:
             reason = check_segment(seg, piped, cwd, assigned, context, shell_pipe)
             if reason:
                 return reason
@@ -341,6 +376,12 @@ def test():
             "echo hi & psql $DATABASE_URL -c 'select * from users'",
             "(psql $DATABASE_URL -c 'select * from users')",
             "if true; then psql $DATABASE_URL -c 'select * from users'; fi",
+            "echo 'psql $DATABASE_URL -c \"select * from users\"' | env sh",
+            "echo 'psql $DATABASE_URL -c \"select * from users\"' | sudo -u postgres bash",
+            "echo 'psql $DATABASE_URL -c \"select * from users\"' | timeout 5 sh",
+            "echo 'psql $DATABASE_URL -c \"select * from users\"' | tee /dev/stderr | command bash",
+            "'psql' $DATABASE_URL -c 'select * from users'",
+            "\"e\"cho hi; \"ps\"ql $DATABASE_URL -c 'select * from users'",
             "psql $DATABASE_URL -c \"select count(*) from users where \\\"x\\\" = 'a'\"",
             "psql $DATABASE_URL -c \"select count(*) from users where status = 'a union select email from users'\"",
         ]
