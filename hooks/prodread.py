@@ -51,8 +51,8 @@ REDIS_ARGS = re.compile(r"\bredis-cli\b(?:\s+-[a-zA-Z]+(?:\s+(?!-)\S+)?|\s+--\S+
 # shell code hidden inside another command: bash -c "...", eval "...", ssh host "...", $(...), `...`
 QUOTED = r"(\"(?:[^\"\\]|\\.)*\"|'[^']*')"
 INNER = [re.compile(r"\b(?:bash|sh|zsh|dash|ksh)\s+(?:-\w+\s+)*-\w*c\w*\s+" + QUOTED), re.compile(r"\beval\s+" + QUOTED),
-         re.compile(r"\bssh\s+(?:-\S+(?:\s+(?!-)\S+)?\s+)*\S+\s+" + QUOTED), re.compile(r"\$\(((?:[^()]|\([^()]*\))*)\)"),
-         re.compile(r"`([^`]*)`"), re.compile(r"[<>]\(((?:[^()]|\([^()]*\))*)\)"), re.compile(r"\bwatch\s+(?:-\S+(?:\s+(?!-)\S+)?\s+)*" + QUOTED)]
+         re.compile(r"\bssh\s+(?:-\S+(?:\s+(?!-)\S+)?\s+)*\S+\s+" + QUOTED),
+         re.compile(r"`([^`]*)`"), re.compile(r"\bwatch\s+(?:-\S+(?:\s+(?!-)\S+)?\s+)*" + QUOTED)]
 # commands that only print or search text: a client name inside their quoted arguments is just text
 # Only commands that print or search text and can't run other programs (not awk, sed, find, sort, rg, git: they can).
 HARMLESS = {"echo", "printf", "grep", "egrep", "fgrep", "cat", "head", "tail", "wc", "ls", "which", "type"}
@@ -176,16 +176,40 @@ def segments(command):
     return out
 
 
+SUBSTITUTION = re.compile(r"[$<>]\(|`")
+MAX_DEPTH = 4
+
+
+def substitutions(text):
+    """Contents of $(...), <(...) and >(...), matched by counting parentheses, so nesting at any depth works."""
+    out, i = [], 0
+    while i < len(text) - 1:
+        if text[i] in "$<>" and text[i + 1] == "(":
+            depth, j = 0, i + 1
+            while j < len(text):
+                depth += {"(": 1, ")": -1}.get(text[j], 0)
+                if depth == 0:
+                    break
+                j += 1
+            out.append(text[i + 2:j])
+            i = j + 1
+        else:
+            i += 1
+    return out
+
+
 def expand(command, depth=0):
-    """The command plus any shell code nested inside it, with the outer text as context."""
-    found = [(command, "")]
-    if depth >= 3:
-        return found
-    for rx in INNER:
-        for m in rx.finditer(command):
-            inner = unquote(m.group(1))
-            found += [(c, ctx + " " + command) for c, ctx in expand(inner, depth + 1)]
-    return found
+    """The command plus any shell code nested inside it, with the outer text as context.
+    -> (pieces, complete). complete is False if the nesting went deeper than we follow."""
+    found, complete = [(command, "")], True
+    if depth >= MAX_DEPTH:
+        return found, not SUBSTITUTION.search(command)
+    inner = [unquote(m.group(1)) for rx in INNER for m in rx.finditer(command)] + substitutions(command)
+    for text in inner:
+        pieces, ok = expand(text, depth + 1)
+        found += [(c, ctx + " " + command) for c, ctx in pieces]
+        complete = complete and ok
+    return found, complete
 
 
 def argv0(text):
@@ -260,8 +284,10 @@ def check_segment(seg, piped, cwd, assigned, context, shell_pipe=False):
         return None if texts and only_metadata(texts) else ASK.format(target=target)
     # what the shell will run: quote characters dropped, contents kept, unless the command only prints or searches text
     head = seg.split("<<")[0]
-    structure = re.sub(QUOTED, "", head)  # subshells, groups, substitutions outside quotes run code of their own
-    if argv0(head) in HARMLESS and not shell_pipe and not re.search(r"[(){}`]|\$\(|[<>]\(", structure):
+    # subshells and groups outside quotes, and substitutions anywhere (they run inside double quotes too)
+    structure = re.sub(QUOTED, "", head)
+    if (argv0(head) in HARMLESS and not shell_pipe and not SUBSTITUTION.search(head)
+            and not re.search(r"[(){}]", structure)):
         return None  # it only prints or searches its arguments; command substitutions are checked separately
     if CLIENT_WORD.search(shell_words(head)):
         return ASK.format(target=target)
@@ -273,7 +299,12 @@ def check_command(command, cwd="."):
     assigned = {}
     for k, v in ASSIGN.findall(command):
         assigned.setdefault(k, []).append(unquote(v))
-    for text, context in expand(command):
+    pieces, complete = expand(command)
+    if not complete:
+        target = prod_target(command, cwd, assigned)
+        if target:
+            return ASK.format(target=target)  # nested deeper than we follow
+    for text, context in pieces:
         segs = segments(text)
         # default-deny: if anything in a pipeline isn't a known print/search command, nothing in it is harmless
         shell_pipe = any(piped and argv0(seg.split("<<")[0]) not in HARMLESS for seg, piped in segs)
@@ -408,6 +439,10 @@ def test():
             "echo hi > >(psql $DATABASE_URL)",
             "env -S \"psql $DATABASE_URL -c 'select * from users'\" echo hi",
             "sudo --preserve-env=PATH cat 'psql $DATABASE_URL -c \"select * from users\"'",
+            "echo \"$(psql $DATABASE_URL -c 'select * from users')\"",
+            "echo \"$(psql $DATABASE_URL -c 'select count(*) from (select (1)) x; select * from users')\"",
+            "cat <(echo $(psql $DATABASE_URL -c 'select * from users'))",
+            "echo $(echo $(echo $(echo $(echo $(psql $DATABASE_URL -c 'select * from users')))))",
             "psql $DATABASE_URL -c \"select count(*) from users where \\\"x\\\" = 'a'\"",
             "psql $DATABASE_URL -c \"select count(*) from users where status = 'a union select email from users'\"",
         ]
