@@ -180,22 +180,64 @@ SUBSTITUTION = re.compile(r"[$<>]\(|`")
 MAX_DEPTH = 4
 
 
+def _balanced(text, start):
+    """Body of the parenthesised group opening at text[start], reading quotes and escapes the way the shell does.
+    -> (body, end_index, unambiguous)"""
+    depth, j, quote, clear = 0, start, None, True
+    while j < len(text):
+        ch = text[j]
+        if quote == "'":
+            if ch == "'":
+                quote = None
+        elif ch == "\\":
+            j += 1
+        elif quote == '"':
+            if ch == '"':
+                quote = None
+            elif ch == "$" and text[j + 1:j + 2] == "(":
+                clear = False  # a substitution inside quotes inside a substitution: too clever for us
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                body = text[start + 1:j]
+                return body, j, clear and not re.search(r"\bcase\b", body)  # case patterns have unbalanced )
+        j += 1
+    return text[start + 1:], len(text), False
+
+
 def substitutions(text):
-    """Contents of $(...), <(...) and >(...), matched by counting parentheses, so nesting at any depth works."""
-    out, i = [], 0
+    """Bodies of $(...), <(...) and >(...) at the top level of text (not inside single quotes, where the shell
+    doesn't expand them). -> (bodies, ambiguous)"""
+    out, ambiguous, i = [], False, 0
     while i < len(text) - 1:
-        if text[i] in "$<>" and text[i + 1] == "(":
-            depth, j = 0, i + 1
-            while j < len(text):
-                depth += {"(": 1, ")": -1}.get(text[j], 0)
-                if depth == 0:
-                    break
-                j += 1
-            out.append(text[i + 2:j])
-            i = j + 1
+        ch = text[i]
+        if ch == "\\":
+            i += 2
+        elif ch == "'":
+            end = text.find("'", i + 1)
+            i = end + 1 if end != -1 else len(text)
+        elif ch in "$<>" and text[i + 1] == "(":
+            body, end, clear = _balanced(text, i + 1)
+            out.append(body)
+            ambiguous = ambiguous or not clear
+            i = end + 1
         else:
             i += 1
-    return out
+    return out, ambiguous
+
+
+def backticks(text):
+    """`...` outside single quotes."""
+    return re.findall(r"`([^`]*)`", re.sub(r"'[^']*'", "", text))
+
+
+HEREDOC = re.compile(r"(?m)^([^\n]*?)<<-?\s*(['\"]?)(\w+)\2[^\n]*\n(.*?)\n\s*\3\s*$", re.S)
+SHELLS = {"sh", "bash", "zsh", "dash", "ksh", "fish", "ssh", "su", "eval", "source", "."}
+INTERPRETERS = {"python", "python3", "node", "perl", "ruby", "php", "deno", "bun"}
 
 
 def expand(command, depth=0):
@@ -204,7 +246,15 @@ def expand(command, depth=0):
     found, complete = [(command, "")], True
     if depth >= MAX_DEPTH:
         return found, not SUBSTITUTION.search(command)
-    inner = [unquote(m.group(1)) for rx in INNER for m in rx.finditer(command)] + substitutions(command)
+    subs, ambiguous = substitutions(command)
+    complete = not ambiguous
+    inner = [unquote(m.group(1)) for rx in INNER if rx.pattern != r"`([^`]*)`" for m in rx.finditer(command)]
+    inner += subs + backticks(command)
+    # heredocs fed to a shell (or to a script that mentions a database client) are code, not data
+    for m in HEREDOC.finditer(command):
+        runner = argv0(re.split(r"[;&|]", m.group(1))[-1])
+        if runner in SHELLS or (runner in INTERPRETERS and CLIENT_WORD.search(m.group(4))):
+            inner.append(m.group(4))
     for text in inner:
         pieces, ok = expand(text, depth + 1)
         found += [(c, ctx + " " + command) for c, ctx in pieces]
@@ -286,7 +336,7 @@ def check_segment(seg, piped, cwd, assigned, context, shell_pipe=False):
     head = seg.split("<<")[0]
     # subshells and groups outside quotes, and substitutions anywhere (they run inside double quotes too)
     structure = re.sub(QUOTED, "", head)
-    if (argv0(head) in HARMLESS and not shell_pipe and not SUBSTITUTION.search(head)
+    if (argv0(head) in HARMLESS and not shell_pipe and not substitutions(head)[0] and not backticks(head)
             and not re.search(r"[(){}]", structure)):
         return None  # it only prints or searches its arguments; command substitutions are checked separately
     if CLIENT_WORD.search(shell_words(head)):
@@ -443,6 +493,11 @@ def test():
             "echo \"$(psql $DATABASE_URL -c 'select count(*) from (select (1)) x; select * from users')\"",
             "cat <(echo $(psql $DATABASE_URL -c 'select * from users'))",
             "echo $(echo $(echo $(echo $(echo $(psql $DATABASE_URL -c 'select * from users')))))",
+            "echo \"$(psql $DATABASE_URL -c 'select \")\" from users')\"",
+            "echo $(case x in x) psql $DATABASE_URL -c 'select * from users';; esac)",
+            "bash <<EOF\npsql $DATABASE_URL -c 'select * from users'\nEOF",
+            "ssh bastion <<'EOF'\npsql -h prod-db -c 'select * from users'\nEOF",
+            "python3 - <<'PY'\nimport subprocess\nsubprocess.run(['psql', 'postgresql://x@db-prod/app', '-c', 'select * from users'])\nPY",
             "psql $DATABASE_URL -c \"select count(*) from users where \\\"x\\\" = 'a'\"",
             "psql $DATABASE_URL -c \"select count(*) from users where status = 'a union select email from users'\"",
         ]
@@ -464,6 +519,8 @@ def test():
             "kubectl --context prod-eks get pods",
             "echo 'psql prod' # just text",
             "cat notes.md | grep 'psql prod'",
+            "echo '$(psql prod)'",
+            "cat <<'EOF'\nrun psql against prod carefully\nEOF",
         ]
         for c in ask:
             assert check_command(c, d), c
