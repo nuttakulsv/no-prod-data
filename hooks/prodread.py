@@ -51,17 +51,21 @@ REDIS_ARGS = re.compile(r"\bredis-cli\b(?:\s+-[a-zA-Z]+(?:\s+(?!-)\S+)?|\s+--\S+
 QUOTED = r"(\"(?:[^\"\\]|\\.)*\"|'[^']*')"
 INNER = [re.compile(r"\b(?:bash|sh|zsh|dash|ksh)\s+(?:-\w+\s+)*-\w*c\w*\s+" + QUOTED), re.compile(r"\beval\s+" + QUOTED),
          re.compile(r"\bssh\s+(?:-\S+(?:\s+(?!-)\S+)?\s+)*\S+\s+" + QUOTED), re.compile(r"\$\(((?:[^()]|\([^()]*\))*)\)"),
-         re.compile(r"`([^`]*)`")]
+         re.compile(r"`([^`]*)`"), re.compile(r"\bwatch\s+(?:-\S+(?:\s+(?!-)\S+)?\s+)*" + QUOTED)]
+# commands that only print or search text: a client name inside their quoted arguments is just text
+HARMLESS = re.compile(r"^\s*(?:\w+=\S+\s+)*(?:echo|printf|grep|egrep|fgrep|rg|ag|cat|less|more|head|tail|sed|awk|jq|wc|sort|"
+                      r"uniq|find|ls|man|which|type|git\s+(?:log|grep|show|diff|commit))\b")
 ASSIGN = re.compile(r"(?:^|[\s;&|])(?:export\s+)?([A-Za-z_]\w*)=(\"[^\"]*\"|'[^']*'|[^\s;&|]+)")
 
 # statements that only look at structure or counts; each must match the WHOLE statement
 # WHERE: plain "column op literal" comparisons only. No casts or functions: "where email::int = 1" fails with an error
 # message that contains the email.
-_LITERAL = r"(?:'(?:[^'\\]|'')*'|-?\d+(?:\.\d+)?|true|false|null)"
-_COND = rf"[\w.\"]+\s*(?:(?:=|!=|<>|<=|>=|<|>|(?:not\s+)?i?like)\s*{_LITERAL}|is\s+(?:not\s+)?null)"
+# literals can't contain SQL keywords, and column names can't be quoted: MySQL reads "..." as a string, Postgres as a name
+_LITERAL = r"(?:'(?:(?!\b(?:union|select|from|into|join|copy)\b)[^'\\])*'|-?\d+(?:\.\d+)?|true|false|null)"
+_COND = rf"[A-Za-z_][\w.]*\s*(?:(?:=|!=|<>|<=|>=|<|>|(?:not\s+)?i?like)\s*{_LITERAL}|is\s+(?:not\s+)?null)"
 _WHERE = rf"(?:\s+where\s+{_COND}(?:\s+(?:and|or)\s+{_COND})*)?"
 # select lists for catalog queries: plain column names only, so no function calls like pg_read_file()
-_SELECT_LIST = r"(?:(?!\b(?:select|from|union|into)\b)[\w\s,.\"*])+?"
+_SELECT_LIST = r"(?:(?!\b(?:select|from|union|into)\b)[\w\s,.*])+?"
 META_SQL = re.compile(r"(?is)^\s*(?:"
     r"\\(?:d[tivmnsufxSEgcpTo]*\+?|l\+?|conninfo)(?:\s+[\w.\"*]+)?"     # psql: \d users, \dt+, \l, \conninfo (not \copy, \o, \g, \!, \i)
     r"|explain\s+(?!.*\banaly[sz]e\b)[^\\]+"                          # plans, not EXPLAIN ANALYZE (it runs the query)
@@ -187,8 +191,10 @@ def check_segment(seg, piped, cwd, assigned, context):
             return None if m and REDIS_META.match(m.group(1)) else ASK.format(target=target)
         texts = query_texts(seg, flag)
         return None if texts and only_metadata(texts) else ASK.format(target=target)
-    unquoted = re.sub(r"\s#.*$", "", re.sub(QUOTED, " ", seg.split("<<")[0]))
-    if CLIENT_WORD.search(unquoted):
+    # what the shell will run: quote characters dropped, contents kept, unless the command only prints or searches text
+    head = seg.split("<<")[0]
+    words = re.sub(QUOTED, " ", head) if HARMLESS.match(head) else re.sub(r"[\"']", " ", head)
+    if CLIENT_WORD.search(re.sub(r"\s#.*$", "", words)):
         return ASK.format(target=target)
     return None
 
@@ -308,6 +314,11 @@ def test():
             "DB=localhost; DB=postgresql://x@db-prod.internal/app; psql $DB -c 'select * from users'",
             "watch -n 5 psql $DATABASE_URL -c 'select * from users'",
             "mywrapper psql $DATABASE_URL -c '\\d users'",
+            "watch -n 5 \"psql $DATABASE_URL -c 'select * from users'\"",
+            "parallel \"psql $DATABASE_URL -c 'select * from users'\"",
+            "foo 'psql' $DATABASE_URL",
+            "psql $DATABASE_URL -c \"select count(*) from users where \\\"x\\\" = 'a'\"",
+            "psql $DATABASE_URL -c \"select count(*) from users where status = 'a union select email from users'\"",
         ]
         fine = [
             'psql "$DATABASE_URL" -c "\\d users"',
