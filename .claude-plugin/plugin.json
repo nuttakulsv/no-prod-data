@@ -1,0 +1,9 @@
+{
+  "name": "no-prod-data",
+  "version": "0.1.0",
+  "description": "Keeps production customer data out of your coding agent's context: asks before commands that read rows from production databases and data stores, allows schema and counts. PDPA/GDPR-minded debugging.",
+  "author": { "name": "nuttakulsv" },
+  "homepage": "https://github.com/nuttakulsv/no-prod-data",
+  "license": "MIT",
+  "keywords": ["privacy", "pdpa", "gdpr", "production", "database", "hooks", "security"]
+}

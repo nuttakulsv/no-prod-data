@@ -1,0 +1,13 @@
+{
+  "description": "Ask before the agent pulls production rows into the conversation",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|mcp__.*",
+        "hooks": [
+          { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/prodread.py\"", "timeout": 10 }
+        ]
+      }
+    ]
+  }
+}

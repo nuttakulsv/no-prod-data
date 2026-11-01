@@ -1,0 +1,12 @@
+{
+  "name": "no-prod-data",
+  "owner": { "name": "nuttakulsv" },
+  "description": "Keep production customer data out of your coding agent's context",
+  "plugins": [
+    {
+      "name": "no-prod-data",
+      "source": "./",
+      "description": "Keeps production customer data out of your coding agent's context: asks before commands that read rows from production databases and data stores, allows schema and counts. PDPA/GDPR-minded debugging."
+    }
+  ]
+}
