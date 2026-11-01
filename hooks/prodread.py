@@ -52,14 +52,27 @@ REDIS_ARGS = re.compile(r"\bredis-cli\b(?:\s+-[a-zA-Z]+(?:\s+(?!-)\S+)?|\s+--\S+
 QUOTED = r"(\"(?:[^\"\\]|\\.)*\"|'[^']*')"
 INNER = [re.compile(r"\b(?:bash|sh|zsh|dash|ksh)\s+(?:-\w+\s+)*-\w*c\w*\s+" + QUOTED), re.compile(r"\beval\s+" + QUOTED),
          re.compile(r"\bssh\s+(?:-\S+(?:\s+(?!-)\S+)?\s+)*\S+\s+" + QUOTED), re.compile(r"\$\(((?:[^()]|\([^()]*\))*)\)"),
-         re.compile(r"`([^`]*)`"), re.compile(r"\bwatch\s+(?:-\S+(?:\s+(?!-)\S+)?\s+)*" + QUOTED)]
+         re.compile(r"`([^`]*)`"), re.compile(r"[<>]\(((?:[^()]|\([^()]*\))*)\)"), re.compile(r"\bwatch\s+(?:-\S+(?:\s+(?!-)\S+)?\s+)*" + QUOTED)]
 # commands that only print or search text: a client name inside their quoted arguments is just text
 # Only commands that print or search text and can't run other programs (not awk, sed, find, sort, rg, git: they can).
 HARMLESS = {"echo", "printf", "grep", "egrep", "fgrep", "cat", "head", "tail", "wc", "ls", "which", "type"}
 # wrappers that run the command after them, and their options that take a value
-WRAPPERS = {"sudo": "-u -g -h -p -C -D -r -t -U", "doas": "-u -C", "env": "-u -C -S", "time": "-o -f", "nohup": "",
-            "command": "", "exec": "-a", "nice": "-n", "ionice": "-c -n -p -P -u", "stdbuf": "-i -o -e",
-            "timeout": "-k -s", "xargs": "-I -i -L -l -n -P -s -d -E -a"}
+# Any other option (and any --long option) means we don't know what runs, so argv0() gives up and nothing is harmless.
+# env -S is left out on purpose: it splits a string into a command and runs it.
+WRAPPERS = {  # name: (options that take a value, options that don't)
+    "sudo": ("-u -g -h -p -C -D -r -t -U -R -T", "-E -H -n -S -b -i -k -K -P -s -A -B -e"),
+    "doas": ("-u -C", "-n -s -L"),
+    "env": ("-u -C", "-i -0 -v"),
+    "time": ("-o -f", "-p -a -v -q"),
+    "nohup": ("", ""),
+    "command": ("", "-p"),
+    "exec": ("-a", "-c -l"),
+    "nice": ("-n", ""),
+    "ionice": ("-c -n -p -P -u", "-t"),
+    "stdbuf": ("-i -o -e", ""),
+    "timeout": ("-k -s", "-v -f"),
+    "xargs": ("-I -i -L -l -n -P -s -d -E -a -e", "-0 -r -t -p -x"),
+}
 SHELL_KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "(", "time"}
 ASSIGN = re.compile(r"(?:^|[\s;&|])(?:export\s+)?([A-Za-z_]\w*)=(\"[^\"]*\"|'[^']*'|[^\s;&|]+)")
 
@@ -194,13 +207,21 @@ def argv0(text):
         name = tok.rsplit("/", 1)[-1]
         if name not in WRAPPERS:
             return name
-        takes_value = WRAPPERS[name].split()
+        takes_value, no_value = (x.split() for x in WRAPPERS[name])
         i += 1
         while i < len(tokens) and tokens[i].startswith("-"):
             opt = tokens[i]
             i += 1
-            if opt in takes_value and i < len(tokens):
+            if opt == "--":
+                break
+            if opt in no_value:
+                continue
+            if opt in takes_value:
                 i += 1
+            elif opt[:2] in takes_value and not opt.startswith("--"):
+                continue  # value attached: -uroot, -oL
+            else:
+                return None  # an option we don't know: can't tell what actually runs
         if name == "timeout" and i < len(tokens) and re.match(r"^\d", tokens[i]):
             i += 1
     return None
@@ -239,7 +260,8 @@ def check_segment(seg, piped, cwd, assigned, context, shell_pipe=False):
         return None if texts and only_metadata(texts) else ASK.format(target=target)
     # what the shell will run: quote characters dropped, contents kept, unless the command only prints or searches text
     head = seg.split("<<")[0]
-    if argv0(head) in HARMLESS and not shell_pipe and not re.search(r"`|\$\(", head):
+    structure = re.sub(QUOTED, "", head)  # subshells, groups, substitutions outside quotes run code of their own
+    if argv0(head) in HARMLESS and not shell_pipe and not re.search(r"[(){}`]|\$\(|[<>]\(", structure):
         return None  # it only prints or searches its arguments; command substitutions are checked separately
     if CLIENT_WORD.search(shell_words(head)):
         return ASK.format(target=target)
@@ -382,6 +404,10 @@ def test():
             "echo 'psql $DATABASE_URL -c \"select * from users\"' | tee /dev/stderr | command bash",
             "'psql' $DATABASE_URL -c 'select * from users'",
             "\"e\"cho hi; \"ps\"ql $DATABASE_URL -c 'select * from users'",
+            "cat <(psql $DATABASE_URL -c 'select * from users')",
+            "echo hi > >(psql $DATABASE_URL)",
+            "env -S \"psql $DATABASE_URL -c 'select * from users'\" echo hi",
+            "sudo --preserve-env=PATH cat 'psql $DATABASE_URL -c \"select * from users\"'",
             "psql $DATABASE_URL -c \"select count(*) from users where \\\"x\\\" = 'a'\"",
             "psql $DATABASE_URL -c \"select count(*) from users where status = 'a union select email from users'\"",
         ]
