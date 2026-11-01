@@ -19,8 +19,10 @@ PROD = re.compile(r"(?i)(?<![a-z])prod(uction)?(?![a-z])|\.rds\.amazonaws\.com|\
                   r"\.neon\.tech|\.psdb\.cloud|\.mongodb\.net|\.database\.azure\.com|\.cockroachlabs\.cloud|\.aivencloud\.com|"
                   r"\.upstash\.io|\.redis(labs)?\.(cloud|com)|--linked\b")
 
-# the command itself, after env assignments and wrappers: "PGPASSWORD=x sudo psql" but not "echo psql"
-AT = r"^\s*(?:(?:sudo|time|nohup|command|exec)\s+|env\s+|\w+=(?:\"[^\"]*\"|'[^']*'|\S+)\s+)*(?:\S*/)?"
+# the command itself, after env assignments and wrappers: "PGPASSWORD=x timeout 30 psql" but not "echo psql"
+WRAP = (r"(?:(?:sudo|time|nohup|command|exec|nice(?:\s+-n\s*-?\d+)?|ionice(?:\s+-\S+)*|stdbuf(?:\s+-\S+)*"
+        r"|xargs(?:\s+-\S+)*|timeout(?:\s+-\S+)*\s+\d+[smhd]?)\s+|env(?:\s+-\S+)*\s+|\w+=(?:\"[^\"]*\"|'[^']*'|\S+)\s+)*")
+AT = r"^\s*" + WRAP + r"(?:\S*/)?"
 # commands that read data, with the flag that carries their query text (if any)
 CLIENTS = [
     (re.compile(AT + r"psql\b"), r"(?:-c|--command)"),
@@ -38,18 +40,32 @@ DUMPS = re.compile(AT + r"(?:(pg_dump|pg_dumpall|mysqldump|mariadb-dump|mongodum
 SCHEMA_ONLY_DUMP = re.compile(r"(?:^|\s)(?:-s|--schema-only|--no-data|-d)(?:\s|$)")
 KUBECTL_DB = re.compile(AT + r"(?:kubectl|docker(?:\s+compose)?|podman)\b.*\bexec\b.*?(?:--\s*|\s)(?:sh\s+-c\s+)?['\"]?"
                         r"(psql|mysql|mariadb|mongosh?|redis-cli)\b")
-REDIS_META = re.compile(r"(?i)^\s*(ping|info|dbsize|config\s+get|memory\s+stats|slowlog|client\s+list|latency|time)\b")
+# other places a client can get its queries from: a file, a redirect, a pipe
+EXTRA_INPUT = re.compile(r"(?:^|\s)(?:-f|--file)(?:\s+|=)\S+|(?<!<)<(?!<)\s*\S+")
+REDIS_META = re.compile(r"(?i)^\s*(ping|info|dbsize|config\s+get|memory\s+stats|slowlog|client\s+list|latency|time)\b[^;|&]*$")
 REDIS_ARGS = re.compile(r"\bredis-cli\b(?:\s+-[a-zA-Z]+(?:\s+(?!-)\S+)?|\s+--\S+(?:\s+(?!-)\S+)?|\s+\S+://\S+)*\s+(\S.*)$")
-# statements that only look at structure or counts
-META_SQL = re.compile(r"""(?ix)^\s*(
-      \\[a-z+]*\S*                                   # psql meta commands: \\d, \\dt+, \\l, \\dn
-    | explain(?!\s+(\(.*analyze|analyze))\b          # plans, not EXPLAIN ANALYZE (it runs the query)
-    | show\s | describe\s | desc\s | use\s | set\s
-    | select\s+(count\s*\(\s*\*?\s*\)|1|version\s*\(\)|now\s*\(\)|current_\w+(\s*\(\))?)\s*(from\s+[\w."]+\s*)?(where\s+[^;]*)?$
-    | select\b.*\bfrom\s+(information_schema|pg_catalog|pg_stat\w*|pg_\w+|mysql\.|sys\.|sqlite_master)
-    | db\.(getCollectionNames|stats|getCollectionInfos|\w+\.(countDocuments|estimatedDocumentCount|getIndexes|stats))\s*\(
-    | show\s+(dbs|collections|databases|tables)
-    )""")
+# shell code hidden inside another command: bash -c "...", eval "...", ssh host "...", $(...), `...`
+QUOTED = r"(\"(?:[^\"\\]|\\.)*\"|'[^']*')"
+INNER = [re.compile(r"\b(?:bash|sh|zsh|dash|ksh)\s+(?:-\w+\s+)*-\w*c\w*\s+" + QUOTED), re.compile(r"\beval\s+" + QUOTED),
+         re.compile(r"\bssh\s+(?:-\S+(?:\s+(?!-)\S+)?\s+)*\S+\s+" + QUOTED), re.compile(r"\$\(((?:[^()]|\([^()]*\))*)\)"),
+         re.compile(r"`([^`]*)`")]
+ASSIGN = re.compile(r"(?:^|[\s;&|])(?:export\s+)?([A-Za-z_]\w*)=(\"[^\"]*\"|'[^']*'|[^\s;&|]+)")
+
+# statements that only look at structure or counts; each must match the WHOLE statement
+_NO_SUBQUERY = r"(?:(?!\b(?:union|join|select|from|into|copy)\b)[^();])*"
+_WHERE = rf"(?:\s+where\s+{_NO_SUBQUERY})?"
+_SELECT_LIST = r"(?:(?!\b(?:select|from|union|into)\b)[\w\s,.\"*()'])+?"
+META_SQL = re.compile(r"(?is)^\s*(?:"
+    r"\\(?:d[tivmnsufxSEgcpTo]*\+?|l\+?|conninfo)(?:\s+[\w.\"*]+)?"     # psql: \d users, \dt+, \l, \conninfo (not \copy, \o, \g, \!, \i)
+    r"|explain\s+(?!.*\banalyze\b).+"                                   # plans, not EXPLAIN ANALYZE (it runs the query)
+    r"|(?:show|describe|desc)\s+[\w.\"` ]+|(?:set|use)\s+[\w.\"' =:-]+"
+    rf"|select\s+(?:count\s*\(\s*\*?\s*\)|1|version\s*\(\s*\)|now\s*\(\s*\)|current_\w+(?:\s*\(\s*\))?)(?:\s+from\s+[\w.\"]+{_WHERE})?"
+    rf"|select\s+{_SELECT_LIST}\s+from\s+(?:information_schema|pg_catalog)\.[\w\"]+{_WHERE}(?:\s+order\s+by\s+[\w\s,.\"]+)?"
+    rf"|select\s+{_SELECT_LIST}\s+from\s+(?:pg_stat_\w+|pg_tables|pg_indexes|pg_class|sqlite_master){_WHERE}"
+    r"|db\.(?:getCollectionNames|getCollectionInfos|stats|serverStatus|version|hostInfo)\(\s*\)"
+    r"|db\.(?:getCollection\(\s*[\"'][\w.-]+[\"']\s*\)|\w+)\.(?:countDocuments|estimatedDocumentCount|getIndexes|stats)\(\s*(?:\{\s*\})?\s*\)"
+    r"|show\s+(?:dbs|collections|databases|tables)"
+    r")\s*;?\s*$")
 
 ASK = """no-prod-data: this looks like it reads data from production ({target}).
 
@@ -58,8 +74,10 @@ Whatever it prints becomes part of this conversation and is sent to the model pr
 Prefer, in order: staging or a sanitized copy; aggregates instead of rows (count, group by); schema only (\\d, information_schema, --schema-only); or ask the user to run it and paste a redacted result. If the user has explicitly agreed to this query, go ahead and select only the columns you need, with a small LIMIT."""
 
 
-def env_value(name, cwd):
-    """Value of an env var from the environment or the project's .env files (never printed)."""
+def env_value(name, cwd, assigned=None):
+    """Value of an env var: set earlier in the same command, in the environment, or in the project's .env files."""
+    if assigned and name in assigned:
+        return assigned[name]
     if os.environ.get(name):
         return os.environ[name]
     for f in (".env", ".env.local", ".env.development", ".env.production"):
@@ -74,15 +92,19 @@ def env_value(name, cwd):
     return ""
 
 
-def prod_target(segment, cwd):
+def prod_target(segment, cwd, assigned=None, context=""):
     """Why we think this segment talks to production, or None."""
-    m = PROD.search(segment)
+    m = PROD.search(segment) or PROD.search(context)
     if m:
         return f"'{m.group(0)}' in the command"
     for var in re.findall(r"\$\{?([A-Z_][A-Z0-9_]*)\}?", segment):
-        if PROD.search(env_value(var, cwd)):
+        if PROD.search(env_value(var, cwd, assigned)):
             return f"${var} points at a production host"
     return None
+
+
+def unquote(q):
+    return q[1:-1] if len(q) >= 2 and q[0] in "\"'" and q[-1] == q[0] else q
 
 
 def query_texts(segment, flag):
@@ -90,8 +112,7 @@ def query_texts(segment, flag):
     texts = []
     if flag:
         for m in re.finditer(rf"(?:^|\s){flag}(?:\s+|=)(\"(?:[^\"\\]|\\.)*\"|'[^']*'|\S+)", segment):
-            q = m.group(1)
-            texts.append(q[1:-1] if q[:1] in "\"'" and q[-1:] == q[:1] else q)
+            texts.append(unquote(m.group(1)))
     heredoc = re.search(r"<<-?\s*['\"]?(\w+)['\"]?[^\n]*\n(.*?)\n\s*\1\s*$", segment, re.S)
     if heredoc:
         texts.append(heredoc.group(2))
@@ -99,12 +120,12 @@ def query_texts(segment, flag):
 
 
 def only_metadata(texts):
-    statements = [s for t in texts for s in re.split(r";\s*", t) if s.strip()]
-    return bool(statements) and all(META_SQL.match(s.strip()) for s in statements)
+    statements = [s for t in texts for s in re.split(r";|\n", t) if s.strip()]
+    return bool(statements) and all(META_SQL.match(s) for s in statements)
 
 
 def segments(command):
-    # keep heredocs attached to their command; split the rest on ; && || and newlines
+    """-> [(segment, reads_from_a_pipe)]. Heredocs stay attached to their command."""
     parts, buf = [], []
     for line in command.split("\n"):
         buf.append(line)
@@ -117,51 +138,93 @@ def segments(command):
     out = []
     for p in parts:
         if "<<" in p:
-            out.append(p)
-        else:
-            out += [s for s in re.split(r"\s*(?:;|&&|\|\|?)\s*", p) if s.strip()]
+            out.append((p, False))
+            continue
+        for chunk in re.split(r"\s*(?:;|&&|\|\|)\s*", p):
+            pieces = [x for x in re.split(r"\s*\|\s*", chunk) if x.strip()]
+            out += [(x, i > 0) for i, x in enumerate(pieces)]
     return out
+
+
+def expand(command, depth=0):
+    """The command plus any shell code nested inside it, with the outer text as context."""
+    found = [(command, "")]
+    if depth >= 3:
+        return found
+    for rx in INNER:
+        for m in rx.finditer(command):
+            inner = unquote(m.group(1))
+            found += [(c, ctx + " " + command) for c, ctx in expand(inner, depth + 1)]
+    return found
+
+
+def check_segment(seg, piped, cwd, assigned, context):
+    if re.match(r"\s*#", seg):
+        return None
+    target = prod_target(seg, cwd, assigned, context)
+    if not target:
+        return None
+    if DUMPS.search(seg):
+        if SCHEMA_ONLY_DUMP.search(seg) and re.search(r"pg_dump|mysqldump|mariadb-dump|supabase\s+db\s+dump", seg):
+            return None
+        return ASK.format(target=target)
+    if KUBECTL_DB.search(seg):
+        return ASK.format(target=target)
+    for rx, flag in CLIENTS:
+        if not rx.search(seg):
+            continue
+        if piped or EXTRA_INPUT.search(seg.split("<<")[0]):
+            return ASK.format(target=target)
+        if "redis-cli" in seg:
+            m = REDIS_ARGS.search(seg)
+            return None if m and REDIS_META.match(m.group(1)) else ASK.format(target=target)
+        texts = query_texts(seg, flag)
+        return None if texts and only_metadata(texts) else ASK.format(target=target)
+    return None
 
 
 def check_command(command, cwd="."):
     """-> reason string if we should ask, else None"""
-    for seg in segments(command):
-        if re.match(r"\s*#", seg):
-            continue
-        target = prod_target(seg, cwd)
-        if not target:
-            continue
-        if DUMPS.search(seg):
-            if SCHEMA_ONLY_DUMP.search(seg) and re.search(r"pg_dump|mysqldump|mariadb-dump|supabase\s+db\s+dump", seg):
-                continue
-            return ASK.format(target=target)
-        if KUBECTL_DB.search(seg):
-            return ASK.format(target=target)
-        for rx, flag in CLIENTS:
-            if not rx.search(seg):
-                continue
-            if "redis-cli" in seg:
-                m = REDIS_ARGS.search(seg)
-                if m and REDIS_META.match(m.group(1)):
-                    break
-                return ASK.format(target=target)
-            texts = query_texts(seg, flag)
-            if texts and only_metadata(texts):
-                break
-            return ASK.format(target=target)
+    assigned = {k: unquote(v) for k, v in ASSIGN.findall(command)}
+    for text, context in expand(command):
+        for seg, piped in segments(text):
+            reason = check_segment(seg, piped, cwd, assigned, context)
+            if reason:
+                return reason
     return None
 
 
+DATA_SERVER = re.compile(r"(?i)postgres|\bpg\b|pg[-_]|mysql|maria|mongo|redis|supabase|sql|\bdb\b|db[-_]|[-_]db|database|bigquery|"
+                         r"snowflake|clickhouse|dynamo|firestore|elastic|neon|planetscale|warehouse")
+METADATA_TOOL = re.compile(r"(?i)^(list|describe|get)_?(tables?|schemas?|collections?|databases?|columns?|indexes|table_schema|"
+                           r"table_info|schema)$|^explain$")
+QUERY_KEY = re.compile(r"(?i)^(sql|query|statement|command|q|code|filter|pipeline|expression)$")
+
+
+def strings_under(value, key=""):
+    """Every string in a nested tool input, with the key it was under."""
+    if isinstance(value, str):
+        yield key, value
+    elif isinstance(value, dict):
+        for k, v in value.items():
+            yield from strings_under(v, str(k))
+    elif isinstance(value, list):
+        for v in value:
+            yield from strings_under(v, key)
+
+
 def check_mcp(tool_name, tool_input):
-    """MCP database tools whose server name says production."""
-    m = re.match(r"mcp__([^_].*?)__(.+)$", tool_name or "")
+    """MCP tools on a production data store: ask unless the call clearly only reads structure."""
+    m = re.match(r"mcp__(.+?)__(.+)$", tool_name or "")
     if not m:
         return None
     server, tool = m.groups()
-    if not PROD.search(server) or not re.search(r"(?i)query|sql|select|find|read|scan|get|execute|run", tool):
+    if not PROD.search(server) or not DATA_SERVER.search(server):
         return None
-    text = " ".join(str(v) for v in (tool_input or {}).values() if isinstance(v, str))
-    if text and only_metadata([text]):
+    if METADATA_TOOL.match(tool):
+        return None
+    queries = [v for k, v in strings_under(tool_input or {}) if QUERY_KEY.match(k)]
+    if queries and only_metadata(queries):
         return None
     return ASK.format(target=f"MCP server '{server}'")
 
@@ -199,6 +262,25 @@ def test():
             "aws --profile prod dynamodb scan --table-name users",
             "cd api && psql $DATABASE_URL",
             "echo 'select * from users' | psql $DATABASE_URL",
+            # ways around an allowlist
+            "psql $DATABASE_URL -c \"select table_name from information_schema.tables union select email from users\"",
+            "psql $DATABASE_URL -c \"select table_name from information_schema.tables where 1=1 union select email from users\"",
+            "psql $DATABASE_URL -c \"select (select email from users limit 1) from information_schema.tables\"",
+            "psql $DATABASE_URL -c \"select count(*) from users where id in (select id from users)\"",
+            "psql $DATABASE_URL -c '\\copy users to stdout'",
+            "psql $DATABASE_URL -c '\\d users' -c 'select * from users'",
+            "psql $DATABASE_URL -c '\\d users' -f dump.sql",
+            "psql $DATABASE_URL -c '\\d users' < query.sql",
+            "cat query.sql | psql $DATABASE_URL -c '\\d users'",
+            "mongosh 'mongodb+srv://u:p@c.ab12c.mongodb.net/shop' --eval 'db.stats()\ndb.users.find()'",
+            "timeout 30 psql \"$DATABASE_URL\" -c 'select * from users'",
+            "nice -n 10 psql $DATABASE_URL -c 'select * from users'",
+            "bash -c \"psql $DATABASE_URL -c 'select * from users'\"",
+            "eval \"psql $DATABASE_URL -c 'select * from users'\"",
+            "echo $(psql $DATABASE_URL -c 'select * from users')",
+            "ssh prod-bastion \"psql -h 10.0.0.5 -c 'select * from users'\"",
+            "export DB=postgresql://app@db-prod.internal/app; psql $DB -c 'select * from users'",
+            "DB=postgresql://app@orders.production.internal/app && psql \"$DB\" -c 'select 1; select * from orders'",
             "psql $DATABASE_URL <<'SQL'\nselect id, email from users where id = 5;\nSQL",
             "psql $DATABASE_URL -c 'explain analyze select * from users'",
         ]
@@ -224,8 +306,13 @@ def test():
         for c in fine:
             assert not check_command(c, d), c
     assert check_mcp("mcp__postgres-prod__query", {"sql": "select * from users"})
+    assert check_mcp("mcp__postgres-prod__query", {"args": {"sql": "select * from users"}}), "nested input"
+    assert check_mcp("mcp__db-prod__run", {}), "no recognizable query on a production data store"
+    assert check_mcp("mcp__supabase-prod__execute_sql", {"query": "select count(*) from users; select * from users"})
     assert not check_mcp("mcp__postgres-prod__query", {"sql": "select count(*) from users"})
+    assert not check_mcp("mcp__postgres-prod__list_tables", {})
     assert not check_mcp("mcp__postgres-staging__query", {"sql": "select * from users"})
+    assert not check_mcp("mcp__sentry-prod__get_issue", {"id": "1"}), "not a data store"
     assert not check_mcp("Bash", {})
     print("ok")
 
