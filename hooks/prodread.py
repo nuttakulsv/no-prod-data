@@ -22,7 +22,8 @@ PROD = re.compile(r"(?i)(?<![a-z])prod(uction)?(?![a-z])|\.rds\.amazonaws\.com|\
 # the command itself, after env assignments and wrappers: "PGPASSWORD=x timeout 30 psql" but not "echo psql"
 WRAP = (r"(?:(?:sudo|time|nohup|command|exec|nice(?:\s+-n\s*-?\d+)?|ionice(?:\s+-\S+)*|stdbuf(?:\s+-\S+)*"
         r"|xargs(?:\s+-\S+)*|timeout(?:\s+-\S+)*\s+\d+[smhd]?)\s+|env(?:\s+-\S+)*\s+|\w+=(?:\"[^\"]*\"|'[^']*'|\S+)\s+)*")
-AT = r"^\s*" + WRAP + r"(?:\S*/)?"
+# also after a subshell, group, negation or shell keyword: (psql ...), { psql ...; }, ! psql, then psql
+AT = r"^\s*(?:[({!]\s*|(?:then|do|else|elif|if|while|until)\s+)*" + WRAP + r"(?:\S*/)?"
 # commands that read data, with the flag that carries their query text (if any)
 CLIENTS = [
     (re.compile(AT + r"psql\b"), r"(?:-c|--command)"),
@@ -53,8 +54,10 @@ INNER = [re.compile(r"\b(?:bash|sh|zsh|dash|ksh)\s+(?:-\w+\s+)*-\w*c\w*\s+" + QU
          re.compile(r"\bssh\s+(?:-\S+(?:\s+(?!-)\S+)?\s+)*\S+\s+" + QUOTED), re.compile(r"\$\(((?:[^()]|\([^()]*\))*)\)"),
          re.compile(r"`([^`]*)`"), re.compile(r"\bwatch\s+(?:-\S+(?:\s+(?!-)\S+)?\s+)*" + QUOTED)]
 # commands that only print or search text: a client name inside their quoted arguments is just text
-HARMLESS = re.compile(r"^\s*(?:\w+=\S+\s+)*(?:echo|printf|grep|egrep|fgrep|rg|ag|cat|less|more|head|tail|sed|awk|jq|wc|sort|"
-                      r"uniq|find|ls|man|which|type|git\s+(?:log|grep|show|diff|commit))\b")
+# Only commands that can't run other programs (not awk, sed, find, sort, rg, git: they can).
+HARMLESS = re.compile(r"^\s*(?:\w+=\S+\s+)*(?:echo|printf|grep|egrep|fgrep|cat|head|tail|wc|ls|which|type)\b")
+# text that ends up being run by a shell or interpreter makes nothing harmless
+PIPE_TO_SHELL = re.compile(r"\|\s*(?:sudo\s+)?(?:\S*/)?(?:sh|bash|zsh|dash|ksh|eval|xargs|parallel|source|python3?|perl|ruby|node)\b")
 ASSIGN = re.compile(r"(?:^|[\s;&|])(?:export\s+)?([A-Za-z_]\w*)=(\"[^\"]*\"|'[^']*'|[^\s;&|]+)")
 
 # statements that only look at structure or counts; each must match the WHOLE statement
@@ -151,7 +154,7 @@ def segments(command):
         if "<<" in p:
             out.append((p, False))
             continue
-        for chunk in re.split(r"\s*(?:;|&&|\|\|)\s*", p):
+        for chunk in re.split(r"\s*(?:;|&&|\|\||(?<![>&<\d])&(?![&>]))\s*", p):
             pieces = [x for x in re.split(r"\s*\|\s*", chunk) if x.strip()]
             out += [(x, i > 0) for i, x in enumerate(pieces)]
     return out
@@ -169,20 +172,29 @@ def expand(command, depth=0):
     return found
 
 
-def check_segment(seg, piped, cwd, assigned, context):
+def shell_words(text):
+    """Roughly what the shell will run: quotes and backslash escapes removed, so ps"q"l and p\\sql read as psql."""
+    return re.sub(r"\\(.)", r"\1", re.sub(r"[\"']", "", text))
+
+
+def check_segment(seg, piped, cwd, assigned, context, shell_pipe=False):
     if re.match(r"\s*#", seg):
         return None
     target = prod_target(seg, cwd, assigned, context)
     if not target:
         return None
-    if DUMPS.search(seg):
+    norm = shell_words(seg.split("<<")[0])
+    first = re.match(AT + r"(\S+)", norm)
+    if first and re.search(r"[$`]", first.group(1)):
+        return ASK.format(target=target)  # the command itself comes from a variable: can't tell what it runs
+    if DUMPS.search(norm):
         if SCHEMA_ONLY_DUMP.search(seg) and re.search(r"pg_dump|mysqldump|mariadb-dump|supabase\s+db\s+dump", seg):
             return None
         return ASK.format(target=target)
-    if KUBECTL_DB.search(seg):
+    if KUBECTL_DB.search(norm):
         return ASK.format(target=target)
     for rx, flag in CLIENTS:
-        if not rx.search(seg):
+        if not rx.search(norm):
             continue
         if piped or EXTRA_INPUT.search(seg.split("<<")[0]):
             return ASK.format(target=target)
@@ -193,7 +205,9 @@ def check_segment(seg, piped, cwd, assigned, context):
         return None if texts and only_metadata(texts) else ASK.format(target=target)
     # what the shell will run: quote characters dropped, contents kept, unless the command only prints or searches text
     head = seg.split("<<")[0]
-    words = re.sub(QUOTED, " ", head) if HARMLESS.match(head) else re.sub(r"[\"']", " ", head)
+    harmless = (HARMLESS.match(shell_words(head)) and not shell_pipe
+                and not re.search(r"[(){}`]|\$\(", re.sub(QUOTED, "", head)))
+    words = shell_words(re.sub(QUOTED, " ", head)) if harmless else shell_words(head)
     if CLIENT_WORD.search(re.sub(r"\s#.*$", "", words)):
         return ASK.format(target=target)
     return None
@@ -205,8 +219,9 @@ def check_command(command, cwd="."):
     for k, v in ASSIGN.findall(command):
         assigned.setdefault(k, []).append(unquote(v))
     for text, context in expand(command):
+        shell_pipe = bool(PIPE_TO_SHELL.search(text))
         for seg, piped in segments(text):
-            reason = check_segment(seg, piped, cwd, assigned, context)
+            reason = check_segment(seg, piped, cwd, assigned, context, shell_pipe)
             if reason:
                 return reason
     return None
@@ -317,6 +332,15 @@ def test():
             "watch -n 5 \"psql $DATABASE_URL -c 'select * from users'\"",
             "parallel \"psql $DATABASE_URL -c 'select * from users'\"",
             "foo 'psql' $DATABASE_URL",
+            "echo x | awk 'BEGIN{system(\"psql $DATABASE_URL -c select\")}'",
+            "find . -name x -exec psql $DATABASE_URL -c 'select * from users' \\;",
+            "ps\"q\"l $DATABASE_URL -c 'select * from users'",
+            "p\\sql $DATABASE_URL -c 'select * from users'",
+            "CMD=psql; $CMD $DATABASE_URL -c 'select * from users'",
+            "echo 'psql $DATABASE_URL -c \"select * from users\"' | sh",
+            "echo hi & psql $DATABASE_URL -c 'select * from users'",
+            "(psql $DATABASE_URL -c 'select * from users')",
+            "if true; then psql $DATABASE_URL -c 'select * from users'; fi",
             "psql $DATABASE_URL -c \"select count(*) from users where \\\"x\\\" = 'a'\"",
             "psql $DATABASE_URL -c \"select count(*) from users where status = 'a union select email from users'\"",
         ]
