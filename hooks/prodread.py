@@ -209,52 +209,94 @@ def _balanced(text, start):
     return text[start + 1:], len(text), False
 
 
-def substitutions(text):
-    """Bodies of $(...), <(...) and >(...) at the top level of text (not inside single quotes, where the shell
-    doesn't expand them). -> (bodies, ambiguous)"""
-    out, ambiguous, i = [], False, 0
-    while i < len(text) - 1:
+def _balanced_raw(text, start):
+    """Like _balanced, for heredoc bodies with an unquoted delimiter: quotes there are just characters."""
+    depth = 0
+    for j in range(start, len(text)):
+        depth += {"(": 1, ")": -1}.get(text[j], 0)
+        if depth == 0:
+            body = text[start + 1:j]
+            return body, j, not re.search(r"\bcase\b", body)
+    return text[start + 1:], len(text), False
+
+
+def scan_shell(text, raw=False):
+    """Command substitutions the shell will run in text: $(...), <(...), >(...) and `...`.
+    Tracks single and double quotes like the shell (an apostrophe inside "..." is just a character; $( and `
+    still run inside "..."). raw=True for unquoted heredoc bodies, where quotes don't protect anything.
+    -> (bodies, ambiguous). Ambiguous (unterminated quotes, case, quoting we don't follow) means: ask."""
+    bodies, ambiguous, i, dq = [], False, 0, False
+    while i < len(text):
         ch = text[i]
         if ch == "\\":
             i += 2
-        elif ch == "'":
+            continue
+        if not raw and not dq and ch == "'":
             end = text.find("'", i + 1)
-            i = end + 1 if end != -1 else len(text)
-        elif ch in "$<>" and text[i + 1] == "(":
-            body, end, clear = _balanced(text, i + 1)
-            out.append(body)
+            if end == -1:
+                return bodies, True
+            i = end + 1
+            continue
+        if not raw and ch == '"':
+            dq = not dq
+            i += 1
+            continue
+        if ch == "`":
+            end = text.find("`", i + 1)
+            if end == -1:
+                return bodies, True
+            bodies.append(text[i + 1:end])
+            i = end + 1
+            continue
+        if text[i + 1:i + 2] == "(" and (ch == "$" or (ch in "<>" and not dq)):
+            body, end, clear = (_balanced_raw if raw else _balanced)(text, i + 1)
+            bodies.append(body)
             ambiguous = ambiguous or not clear
             i = end + 1
-        else:
-            i += 1
-    return out, ambiguous
+            continue
+        i += 1
+    return bodies, ambiguous or dq
 
 
-def backticks(text):
-    """`...` outside single quotes."""
-    return re.findall(r"`([^`]*)`", re.sub(r"'[^']*'", "", text))
-
-
-HEREDOC = re.compile(r"(?m)^([^\n]*?)<<-?\s*(['\"]?)(\w+)\2[^\n]*\n(.*?)\n\s*\3\s*$", re.S)
+# lead, quote, delimiter, rest of the line, body
+HEREDOC = re.compile(r"(?m)^([^\n]*?)<<-?\s*(['\"]?)(\w+)\2([^\n]*)\n(.*?)\n\s*\3\s*$", re.S)
 SHELLS = {"sh", "bash", "zsh", "dash", "ksh", "fish", "ssh", "su", "eval", "source", "."}
 INTERPRETERS = {"python", "python3", "node", "perl", "ruby", "php", "deno", "bun"}
+SQL_CLIENTS = {"psql", "mysql", "mariadb", "mongosh", "mongo", "sqlcmd", "clickhouse-client", "cqlsh", "snowsql", "redis-cli", "bq"}
+
+
+def shell_code(command):
+    """-> (pieces of shell code nested in command, ambiguous)"""
+    heredocs = list(HEREDOC.finditer(command))
+    outer = command
+    for m in reversed(heredocs):
+        outer = outer[:m.start(5)] + outer[m.end(5):]
+    inner = [unquote(m.group(1)) for rx in INNER if rx.pattern != r"`([^`]*)`" for m in rx.finditer(outer)]
+    bodies, ambiguous = scan_shell(outer)
+    inner += bodies
+    for m in heredocs:
+        lead, quote, rest, body = m.group(1), m.group(2), m.group(4), m.group(5)
+        if not quote:  # unquoted delimiter: the shell expands $(...) and `...` in the body whatever quotes surround them
+            raw_bodies, raw_ambiguous = scan_shell(body, raw=True)
+            inner += raw_bodies
+            ambiguous = ambiguous or raw_ambiguous
+        runner = argv0(re.split(r"[;&|]", lead)[-1])
+        piped_to = [argv0(x) for x in rest.split("|")[1:] if x.strip()]
+        if runner in SHELLS or runner in INTERPRETERS or any(t not in HARMLESS for t in piped_to):
+            inner.append(body)  # the body is code
+        elif runner not in HARMLESS and runner not in SQL_CLIENTS and CLIENT_WORD.search(body):
+            inner.append(body)  # a consumer we don't know, and the body names a database client
+    return inner, ambiguous
 
 
 def expand(command, depth=0):
     """The command plus any shell code nested inside it, with the outer text as context.
-    -> (pieces, complete). complete is False if the nesting went deeper than we follow."""
-    found, complete = [(command, "")], True
+    -> (pieces, complete). complete is False if the nesting went deeper than we follow or was ambiguous."""
+    found = [(command, "")]
     if depth >= MAX_DEPTH:
         return found, not SUBSTITUTION.search(command)
-    subs, ambiguous = substitutions(command)
+    inner, ambiguous = shell_code(command)
     complete = not ambiguous
-    inner = [unquote(m.group(1)) for rx in INNER if rx.pattern != r"`([^`]*)`" for m in rx.finditer(command)]
-    inner += subs + backticks(command)
-    # heredocs fed to a shell (or to a script that mentions a database client) are code, not data
-    for m in HEREDOC.finditer(command):
-        runner = argv0(re.split(r"[;&|]", m.group(1))[-1])
-        if runner in SHELLS or (runner in INTERPRETERS and CLIENT_WORD.search(m.group(4))):
-            inner.append(m.group(4))
     for text in inner:
         pieces, ok = expand(text, depth + 1)
         found += [(c, ctx + " " + command) for c, ctx in pieces]
@@ -336,7 +378,7 @@ def check_segment(seg, piped, cwd, assigned, context, shell_pipe=False):
     head = seg.split("<<")[0]
     # subshells and groups outside quotes, and substitutions anywhere (they run inside double quotes too)
     structure = re.sub(QUOTED, "", head)
-    if (argv0(head) in HARMLESS and not shell_pipe and not substitutions(head)[0] and not backticks(head)
+    if (argv0(head) in HARMLESS and not shell_pipe and not any(scan_shell(head))
             and not re.search(r"[(){}]", structure)):
         return None  # it only prints or searches its arguments; command substitutions are checked separately
     if CLIENT_WORD.search(shell_words(head)):
@@ -498,6 +540,12 @@ def test():
             "bash <<EOF\npsql $DATABASE_URL -c 'select * from users'\nEOF",
             "ssh bastion <<'EOF'\npsql -h prod-db -c 'select * from users'\nEOF",
             "python3 - <<'PY'\nimport subprocess\nsubprocess.run(['psql', 'postgresql://x@db-prod/app', '-c', 'select * from users'])\nPY",
+            "echo \"it's $(psql $DATABASE_URL -c 'select * from users')\"",
+            "echo \"it's `psql $DATABASE_URL -c 'select * from users'`\"",
+            "cat <<EOF\nit's $(psql $DATABASE_URL -c 'select * from users')\nEOF",
+            "cat <<EOF | bash\npsql $DATABASE_URL -c 'select * from users'\nEOF",
+            "mytool <<EOF\npsql $DATABASE_URL -c 'select * from users'\nEOF",
+            "echo 'unterminated $(psql $DATABASE_URL -c \"select * from users\")",
             "psql $DATABASE_URL -c \"select count(*) from users where \\\"x\\\" = 'a'\"",
             "psql $DATABASE_URL -c \"select count(*) from users where status = 'a union select email from users'\"",
         ]
@@ -521,6 +569,8 @@ def test():
             "cat notes.md | grep 'psql prod'",
             "echo '$(psql prod)'",
             "cat <<'EOF'\nrun psql against prod carefully\nEOF",
+            "cat <<EOF\nrun psql against prod carefully\nEOF",
+            "echo \"it's fine, psql is down on prod\"",
         ]
         for c in ask:
             assert check_command(c, d), c
